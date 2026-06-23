@@ -114,7 +114,17 @@ final class GFNStreamController: NSObject {
         LKRTCInitializeSSL()
         let encoderFactory = LKRTCDefaultVideoEncoderFactory()
         let decoderFactory = LKRTCDefaultVideoDecoderFactory()
-        return LKRTCPeerConnectionFactory(encoderFactory: encoderFactory, decoderFactory: decoderFactory)
+        // bypassVoiceProcessing: the default ADM uses the VoiceProcessingIO audio unit
+        // (VoIP echo cancellation), which needs a mic/input route. The Apple TV has no
+        // microphone, so that unit fails to start and playout is silent. We only ever
+        // receive game audio (no mic by default), so bypass it and use plain RemoteIO.
+        return LKRTCPeerConnectionFactory(
+            audioDeviceModuleType: .platformDefault,
+            bypassVoiceProcessing: true,
+            encoderFactory: encoderFactory,
+            decoderFactory: decoderFactory,
+            audioProcessingModule: nil
+        )
     }()
 
     // MARK: Connect
@@ -268,18 +278,26 @@ final class GFNStreamController: NSObject {
         sdp.components(separatedBy: "\r\n").forEach { print("  \($0)") }
 
         // Configure audio session for real-time streaming before creating the peer connection.
-        // .playback + .moviePlayback gives the lowest latency path; allowBluetooth covers
-        // Bluetooth headsets paired to Apple TV.
+        // Configure the audio session through WebRTC's own wrapper so the audio device
+        // module stays in sync. With useManualAudio = NO, WebRTC applies its default config
+        // (.playAndRecord/.voiceChat) when playout starts — which fails on the mic-less
+        // Apple TV and leaves audio silent. Override WebRTC's config to a plain .playback
+        // (no record, no category options) and activate it through RTCAudioSession.
+        let audioConfig = LKRTCAudioSessionConfiguration.webRTC()
+        audioConfig.category = AVAudioSession.Category.playback.rawValue
+        audioConfig.mode = AVAudioSession.Mode.moviePlayback.rawValue
+        audioConfig.categoryOptions = []
+        LKRTCAudioSessionConfiguration.setWebRTC(audioConfig)
+
+        let rtcSession = LKRTCAudioSession.sharedInstance()
+        rtcSession.lockForConfiguration()
         do {
-            try AVAudioSession.sharedInstance().setCategory(
-                .playback,
-                mode: .moviePlayback,
-                options: [.allowBluetooth, .allowBluetoothA2DP]
-            )
-            try AVAudioSession.sharedInstance().setActive(true)
+            try rtcSession.setConfiguration(audioConfig, active: true)
+            print("[Stream] WebRTC audio session set: category=\(rtcSession.category) active=\(rtcSession.isActive)")
         } catch {
-            print("[Stream] AVAudioSession configuration failed (non-fatal): \(error)")
+            print("[Stream] WebRTC audio session config failed: \(error)")
         }
+        rtcSession.unlockForConfiguration()
 
         // The lifetime is immutable after channel creation, so resolve the server's value first.
         if let match = sdp.range(of: #"ri\.partialReliableThresholdMs[: ]+(\d+)"#, options: .regularExpression),
